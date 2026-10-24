@@ -8,11 +8,8 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
-set(EXTENSION_SOURCES
-    src/zeek_extension.cpp
-    src/zeek_reader.cpp
-    src/zeek_scanner.cpp
-)
+set(EXTENSION_SOURCES src/zeek_extension.cpp src/zeek_reader.cpp
+                      src/zeek_scanner.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
