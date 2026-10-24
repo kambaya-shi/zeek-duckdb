@@ -116,12 +116,14 @@ SELECT COUNT(*) FROM read_zeek('logs/*/notice*', union_by_name=true, ignore_file
 git clone --recurse-submodules https://github.com/ynadji/zeek-duckdb.git
 cd zeek-duckdb
 
-# Build
-make release
+# Build against the released DuckDB v2.0.0
+DUCKDB_VERSION=v2.0.0 make release
 
 # Run tests
 make test
 ```
+
+`DUCKDB_VERSION=v2.0.0` makes the build report the released version, which is what the extension targets. Without it, the build reports a dev version (for example `v2.0.0-dev1`), and `INSTALL inet` fails for that build.
 
 ### Build Artifacts
 
