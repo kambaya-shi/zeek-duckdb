@@ -26,8 +26,8 @@ SELECT typeof(host_ip) FROM read_zeek('data/known_hosts_20260116_00.00.00-01.00.
 ----
 INET
 
-# Filter on INET column — the scanner handles INET filters itself (pushdown enabled) so DuckDB
-# does not extract them into a PhysicalFilter. Verify this produces correct results.
+# Filter on INET column. INET pushdown is enabled, so DuckDB keeps the filter in the scan (as an optional
+# filter) instead of extracting it into a PhysicalFilter. Verify this produces correct results.
 query I
 SELECT COUNT(*) FROM read_zeek('data/dns.log.gz') WHERE id_orig_h = '10.20.40.41'::inet;
 ----
@@ -66,7 +66,7 @@ SELECT id_orig_h, id_resp_h FROM read_zeek('data/dns.log.gz', inet:=false) WHERE
 # Regression: an INET = / IN / OR filter combined with a multi-column projection used to crash with
 # "Attempted to access index N within vector of size N". The crash came from DuckDB extracting the
 # filter into a PhysicalFilter (because INET was not advertised as a pushdown type) and corrupting
-# projection_ids on a multi-column projection. The scanner now handles INET filters itself.
+# projection_ids on a multi-column projection. Advertising INET as a pushdown type keeps the filter in the scan.
 
 # Multi-column projection + INET equality filter.
 query II
@@ -92,3 +92,23 @@ query I
 SELECT COUNT(*) FROM (SELECT id_resp_h, id_orig_h FROM read_zeek('data/dns.log.gz') WHERE id_orig_h <<= '10.0.0.0/8'::inet);
 ----
 2
+
+# Filter-only columns: the filter column is not in the projected output. Expected values come from the two data
+# rows (both id_resp_h = 8.8.4.4; qtype_name A / AAAA).
+query T
+SELECT string_agg(qtype_name, ',' ORDER BY qtype_name) FROM read_zeek('data/dns.log.gz') WHERE id_resp_h = '8.8.4.4'::inet;
+----
+A,AAAA
+
+# Filter-only INET column in an IN list, with a multi-column projection that does not include it.
+query II
+SELECT id_orig_h, qtype_name FROM read_zeek('data/dns.log.gz') WHERE id_resp_h IN ('8.8.4.4'::inet) ORDER BY qtype_name;
+----
+10.20.40.41	A
+10.20.40.41	AAAA
+
+# Two filter-only columns (one INET, one VARCHAR), neither projected.
+query T
+SELECT query FROM read_zeek('data/dns.log.gz') WHERE id_resp_h = '8.8.4.4'::inet AND qtype_name = 'AAAA';
+----
+account-api.icann.org

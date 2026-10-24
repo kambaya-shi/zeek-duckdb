@@ -2,16 +2,14 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/enums/file_compression_type.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/null_filter.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/common/value_operations/value_operations.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 
 #include <cstring>
 #include <unordered_map>
@@ -144,10 +142,8 @@ static Value SliceToValue(ClientContext &context, const FieldSlice &field, const
 	if (IsInetType(type)) {
 		// The slice is the textual address; cast a VARCHAR Value to INET so the comparison runs
 		// with the inet extension's semantics (normalization, IP-aware ordering).
-		Value inet_val;
-		string error_message;
-		if (Value(string(field.ptr, field.len)).TryCastAs(context, type, inet_val, &error_message)) {
-			return inet_val;
+		if (auto inet_val = Value(string(field.ptr, field.len)).TryCastAs(context, type)) {
+			return *inet_val;
 		}
 		return Value(type);
 	}
@@ -204,57 +200,6 @@ static Value SliceToValue(ClientContext &context, const FieldSlice &field, const
 	default:
 		// Should never be reached — CanPushdownFilterOnType restricts the types we see here.
 		return Value(type);
-	}
-}
-
-//! Evaluate a filter against a value. `is_null` indicates whether `val` represents a SQL NULL
-//! (Value is not null-tagged otherwise). Returns true if the row passes the filter.
-static bool EvaluateFilter(const TableFilter &filter, const Value &val, bool is_null) {
-	switch (filter.filter_type) {
-	case TableFilterType::IS_NULL:
-		return is_null;
-	case TableFilterType::IS_NOT_NULL:
-		return !is_null;
-	case TableFilterType::CONSTANT_COMPARISON: {
-		if (is_null) {
-			// NULL compared with anything is NULL → row filtered out.
-			return false;
-		}
-		return filter.Cast<ConstantFilter>().Compare(val);
-	}
-	case TableFilterType::IN_FILTER: {
-		if (is_null) {
-			return false;
-		}
-		auto &in_filter = filter.Cast<InFilter>();
-		for (auto &v : in_filter.values) {
-			if (!v.IsNull() && ValueOperations::Equals(v, val)) {
-				return true;
-			}
-		}
-		return false;
-	}
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &conj = filter.Cast<ConjunctionAndFilter>();
-		for (auto &child : conj.child_filters) {
-			if (!EvaluateFilter(*child, val, is_null)) {
-				return false;
-			}
-		}
-		return true;
-	}
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &conj = filter.Cast<ConjunctionOrFilter>();
-		for (auto &child : conj.child_filters) {
-			if (EvaluateFilter(*child, val, is_null)) {
-				return true;
-			}
-		}
-		return false;
-	}
-	default:
-		// Unknown filter type — be safe: let the row through, DuckDB will re-evaluate post-scan.
-		return true;
 	}
 }
 
@@ -348,7 +293,7 @@ static bool OpenNextFile(ClientContext &context, ZeekScanGlobalState &gstate, Ze
 static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, Vector &vec, idx_t row_idx,
                             const FieldSlice &field, char set_separator, const LogicalType &child_type,
                             const string &unset_field, const string &empty_field) {
-	auto &list_entry = ListVector::GetData(vec)[row_idx];
+	auto &list_entry = FlatVector::GetDataMutable<list_entry_t>(vec)[row_idx];
 	auto current_size = ListVector::GetListSize(vec);
 
 	if (SliceEquals(field, unset_field) || SliceEquals(field, empty_field)) {
@@ -363,7 +308,7 @@ static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, 
 	list_entry.offset = current_size;
 	list_entry.length = elements.size();
 
-	auto &child_vec = ListVector::GetEntry(vec);
+	auto &child_vec = ListVector::GetChildMutable(vec);
 	ListVector::Reserve(vec, current_size + elements.size());
 	ListVector::SetListSize(vec, current_size + elements.size());
 
@@ -383,7 +328,7 @@ static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, 
 		case LogicalTypeId::DOUBLE: {
 			double val;
 			if (TryCast::Operation<string_t, double>(elem_str, val)) {
-				FlatVector::GetData<double>(child_vec)[child_idx] = val;
+				FlatVector::GetDataMutable<double>(child_vec)[child_idx] = val;
 			} else {
 				FlatVector::SetNull(child_vec, child_idx, true);
 			}
@@ -392,7 +337,7 @@ static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, 
 		case LogicalTypeId::UBIGINT: {
 			uint64_t val;
 			if (TryCast::Operation<string_t, uint64_t>(elem_str, val)) {
-				FlatVector::GetData<uint64_t>(child_vec)[child_idx] = val;
+				FlatVector::GetDataMutable<uint64_t>(child_vec)[child_idx] = val;
 			} else {
 				FlatVector::SetNull(child_vec, child_idx, true);
 			}
@@ -401,21 +346,21 @@ static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, 
 		case LogicalTypeId::BIGINT: {
 			int64_t val;
 			if (TryCast::Operation<string_t, int64_t>(elem_str, val)) {
-				FlatVector::GetData<int64_t>(child_vec)[child_idx] = val;
+				FlatVector::GetDataMutable<int64_t>(child_vec)[child_idx] = val;
 			} else {
 				FlatVector::SetNull(child_vec, child_idx, true);
 			}
 			break;
 		}
 		case LogicalTypeId::BOOLEAN: {
-			FlatVector::GetData<bool>(child_vec)[child_idx] =
+			FlatVector::GetDataMutable<bool>(child_vec)[child_idx] =
 			    (elem.len == 1 && elem.ptr[0] == 'T') || (elem.len == 4 && std::memcmp(elem.ptr, "true", 4) == 0);
 			break;
 		}
 		case LogicalTypeId::TIMESTAMP_TZ: {
 			double val;
 			if (TryCast::Operation<string_t, double>(elem_str, val)) {
-				FlatVector::GetData<timestamp_tz_t>(child_vec)[child_idx] = EpochSecondsToTimestampTZ(val);
+				FlatVector::GetDataMutable<timestamp_tz_t>(child_vec)[child_idx] = EpochSecondsToTimestampTZ(val);
 			} else {
 				FlatVector::SetNull(child_vec, child_idx, true);
 			}
@@ -424,7 +369,7 @@ static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, 
 		case LogicalTypeId::INTERVAL: {
 			double val;
 			if (TryCast::Operation<string_t, double>(elem_str, val)) {
-				FlatVector::GetData<interval_t>(child_vec)[child_idx] = SecondsToInterval(val);
+				FlatVector::GetDataMutable<interval_t>(child_vec)[child_idx] = SecondsToInterval(val);
 			} else {
 				FlatVector::SetNull(child_vec, child_idx, true);
 			}
@@ -433,14 +378,14 @@ static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, 
 		case LogicalTypeId::USMALLINT: {
 			uint16_t val;
 			if (TryCast::Operation<string_t, uint16_t>(elem_str, val)) {
-				FlatVector::GetData<uint16_t>(child_vec)[child_idx] = val;
+				FlatVector::GetDataMutable<uint16_t>(child_vec)[child_idx] = val;
 			} else {
 				FlatVector::SetNull(child_vec, child_idx, true);
 			}
 			break;
 		}
 		case LogicalTypeId::VARCHAR: {
-			FlatVector::GetData<string_t>(child_vec)[child_idx] =
+			FlatVector::GetDataMutable<string_t>(child_vec)[child_idx] =
 			    StringVector::AddString(child_vec, elem.ptr, elem.len);
 			break;
 		}
@@ -453,7 +398,7 @@ static void AppendListValue(ClientContext &context, ZeekScanLocalState &lstate, 
 }
 
 static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ZeekScanBindData>();
 	string pattern = input.inputs[0].GetValue<string>();
 
@@ -610,7 +555,7 @@ static unique_ptr<FunctionData> ZeekScanBind(ClientContext &context, TableFuncti
 		if (replace_periods) {
 			std::replace(col_name.begin(), col_name.end(), '.', '_');
 		}
-		names.push_back(col_name);
+		names.push_back(Identifier(col_name));
 		LogicalType col_type = ZeekReader::ZeekTypeToDuckDBType(result->header.types[i], result->use_inet, &context);
 		return_types.push_back(col_type);
 		result->column_types.push_back(col_type);
@@ -667,6 +612,9 @@ static unique_ptr<GlobalTableFunctionState> ZeekScanInitGlobal(ClientContext &co
 		}
 	}
 
+	// Pushed-down filter keys are positions in column_ids, so keep the scanned columns in that order.
+	result->scan_schema_cols = input.column_ids;
+
 	// Capture any pushed-down filters for per-row evaluation.
 	result->filters = input.filters;
 
@@ -689,6 +637,16 @@ static unique_ptr<LocalTableFunctionState> ZeekScanInitLocal(ExecutionContext &c
 		}
 	}
 
+	// Build this thread's filter evaluators. Executors are not thread-safe, so each thread needs its own.
+	if (gstate.filters) {
+		result->filter_executors.resize(gstate.scan_schema_cols.size());
+		for (auto &entry : *gstate.filters) {
+			auto &expr_filter = ExpressionFilter::GetExpressionFilter(entry.Filter(), "read_zeek");
+			result->filter_executors[entry.GetIndex().GetIndex()] =
+			    make_uniq<ExpressionExecutor>(context.client, *expr_filter.expr);
+		}
+	}
+
 	return std::move(result);
 }
 
@@ -698,7 +656,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 	auto &lstate = data.local_state->Cast<ZeekScanLocalState>();
 
 	if (lstate.finished) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -744,15 +702,17 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 		// without parsing the non-filter projected columns.
 		if (gstate.filters) {
 			bool row_passes = true;
-			for (auto &entry : gstate.filters->filters) {
-				idx_t filter_out_idx = entry.first; // index into projected_schema_cols
-				const TableFilter &filter = *entry.second;
-				column_t schema_col = gstate.projected_schema_cols[filter_out_idx];
+			for (auto &entry : *gstate.filters) {
+				// Filter keys are positions in column_ids, so they map to schema columns via scan_schema_cols.
+				idx_t scan_idx = entry.GetIndex().GetIndex();
+				column_t schema_col = gstate.scan_schema_cols[scan_idx];
+				auto &expr_filter = ExpressionFilter::GetExpressionFilter(entry.Filter(), "read_zeek");
+				auto &executor = *lstate.filter_executors[scan_idx];
 
 				// Filename virtual column filter (VARCHAR).
 				if (bind_data.filename_column && schema_col == filename_col_idx) {
 					Value v(lstate.current_file_path);
-					if (!EvaluateFilter(filter, v, false)) {
+					if (!expr_filter.EvaluateWithConstant(executor, v)) {
 						row_passes = false;
 						break;
 					}
@@ -764,7 +724,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 				idx_t file_field_idx = lstate.field_lookup[schema_col];
 				if (file_field_idx >= num_fields) {
 					Value null_val(bind_data.column_types[schema_col]);
-					if (!EvaluateFilter(filter, null_val, true)) {
+					if (!expr_filter.EvaluateWithConstant(executor, null_val)) {
 						row_passes = false;
 						break;
 					}
@@ -776,7 +736,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 				// Unset/empty marker → treat as NULL.
 				if (SliceEquals(field, unset_field) || SliceEquals(field, empty_field)) {
 					Value null_val(bind_data.column_types[schema_col]);
-					if (!EvaluateFilter(filter, null_val, true)) {
+					if (!expr_filter.EvaluateWithConstant(executor, null_val)) {
 						row_passes = false;
 						break;
 					}
@@ -785,7 +745,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 				// Parse the slice into a Value of the column's type and evaluate.
 				Value row_val = SliceToValue(context, field, bind_data.column_types[schema_col]);
-				if (!EvaluateFilter(filter, row_val, row_val.IsNull())) {
+				if (!expr_filter.EvaluateWithConstant(executor, row_val)) {
 					row_passes = false;
 					break;
 				}
@@ -802,7 +762,8 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 			// Filename virtual column.
 			if (bind_data.filename_column && schema_col == filename_col_idx) {
-				FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, lstate.current_file_path);
+				FlatVector::GetDataMutable<string_t>(vec)[row_count] =
+				    StringVector::AddString(vec, lstate.current_file_path);
 				continue;
 			}
 
@@ -830,13 +791,14 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 
 			switch (type_id) {
 			case LogicalTypeId::VARCHAR: {
-				FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, field.ptr, field.len);
+				FlatVector::GetDataMutable<string_t>(vec)[row_count] =
+				    StringVector::AddString(vec, field.ptr, field.len);
 				break;
 			}
 			case LogicalTypeId::DOUBLE: {
 				double val;
 				if (TryCast::Operation<string_t, double>(field_str, val)) {
-					FlatVector::GetData<double>(vec)[row_count] = val;
+					FlatVector::GetDataMutable<double>(vec)[row_count] = val;
 				} else {
 					FlatVector::SetNull(vec, row_count, true);
 				}
@@ -845,7 +807,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 			case LogicalTypeId::UBIGINT: {
 				uint64_t val;
 				if (TryCast::Operation<string_t, uint64_t>(field_str, val)) {
-					FlatVector::GetData<uint64_t>(vec)[row_count] = val;
+					FlatVector::GetDataMutable<uint64_t>(vec)[row_count] = val;
 				} else {
 					FlatVector::SetNull(vec, row_count, true);
 				}
@@ -854,21 +816,22 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 			case LogicalTypeId::BIGINT: {
 				int64_t val;
 				if (TryCast::Operation<string_t, int64_t>(field_str, val)) {
-					FlatVector::GetData<int64_t>(vec)[row_count] = val;
+					FlatVector::GetDataMutable<int64_t>(vec)[row_count] = val;
 				} else {
 					FlatVector::SetNull(vec, row_count, true);
 				}
 				break;
 			}
 			case LogicalTypeId::BOOLEAN: {
-				FlatVector::GetData<bool>(vec)[row_count] = (field.len == 1 && field.ptr[0] == 'T') ||
-				                                            (field.len == 4 && std::memcmp(field.ptr, "true", 4) == 0);
+				FlatVector::GetDataMutable<bool>(vec)[row_count] =
+				    (field.len == 1 && field.ptr[0] == 'T') ||
+				    (field.len == 4 && std::memcmp(field.ptr, "true", 4) == 0);
 				break;
 			}
 			case LogicalTypeId::TIMESTAMP_TZ: {
 				double val;
 				if (TryCast::Operation<string_t, double>(field_str, val)) {
-					FlatVector::GetData<timestamp_tz_t>(vec)[row_count] = EpochSecondsToTimestampTZ(val);
+					FlatVector::GetDataMutable<timestamp_tz_t>(vec)[row_count] = EpochSecondsToTimestampTZ(val);
 				} else {
 					FlatVector::SetNull(vec, row_count, true);
 				}
@@ -877,7 +840,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 			case LogicalTypeId::INTERVAL: {
 				double val;
 				if (TryCast::Operation<string_t, double>(field_str, val)) {
-					FlatVector::GetData<interval_t>(vec)[row_count] = SecondsToInterval(val);
+					FlatVector::GetDataMutable<interval_t>(vec)[row_count] = SecondsToInterval(val);
 				} else {
 					FlatVector::SetNull(vec, row_count, true);
 				}
@@ -886,7 +849,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 			case LogicalTypeId::USMALLINT: {
 				uint16_t val;
 				if (TryCast::Operation<string_t, uint16_t>(field_str, val)) {
-					FlatVector::GetData<uint16_t>(vec)[row_count] = val;
+					FlatVector::GetDataMutable<uint16_t>(vec)[row_count] = val;
 				} else {
 					FlatVector::SetNull(vec, row_count, true);
 				}
@@ -901,7 +864,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 			default: {
 				// Non-native type (e.g. INET): write the slice into the temp VARCHAR vector
 				// (target_vec is the temp). The batch cast at end of chunk converts to the real type.
-				FlatVector::GetData<string_t>(target_vec)[row_count] =
+				FlatVector::GetDataMutable<string_t>(target_vec)[row_count] =
 				    StringVector::AddString(target_vec, field.ptr, field.len);
 				break;
 			}
@@ -921,7 +884,7 @@ static void ZeekScanExecute(ClientContext &context, TableFunctionInput &data, Da
 		}
 	}
 
-	output.SetCardinality(row_count);
+	output.SetChildCardinality(row_count);
 }
 
 //! Callback: can we push down a filter on the given (schema) column index?
@@ -938,11 +901,13 @@ static bool ZeekSupportsPushdownType(const FunctionData &bind_data_p, idx_t col_
 TableFunction GetZeekScanFunction() {
 	TableFunction func("read_zeek", {LogicalType::VARCHAR}, ZeekScanExecute, ZeekScanBind, ZeekScanInitGlobal,
 	                   ZeekScanInitLocal);
-	func.named_parameters["filename"] = LogicalType::BOOLEAN;
-	func.named_parameters["replace_periods"] = LogicalType::BOOLEAN;
-	func.named_parameters["inet"] = LogicalType::BOOLEAN;
-	func.named_parameters["union_by_name"] = LogicalType::BOOLEAN;
-	func.named_parameters["ignore_file_errors"] = LogicalType::BOOLEAN;
+	func.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("filename", LogicalType::BOOLEAN)
+		    .Add("replace_periods", LogicalType::BOOLEAN)
+		    .Add("inet", LogicalType::BOOLEAN)
+		    .Add("union_by_name", LogicalType::BOOLEAN)
+		    .Add("ignore_file_errors", LogicalType::BOOLEAN);
+	});
 	func.projection_pushdown = true;
 	func.filter_pushdown = true;
 	func.supports_pushdown_type = ZeekSupportsPushdownType;
