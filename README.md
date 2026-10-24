@@ -7,7 +7,7 @@ A DuckDB extension for reading [Zeek](https://zeek.org/) (formerly Bro) network 
 Starting with DuckDB v1.5.1, the Zeek extension can be installed from community with:
 
 ```
-¡ duckdb
+$ duckdb
 DuckDB v1.5.1 (Variegata)
 Enter ".help" for usage hints.
 memory D INSTALL inet;
@@ -23,6 +23,8 @@ memory D SELECT * FROM read_zeek('data/dns.log.gz');
 └───────────────────────────────┴────────────────────┴─────────────┴───────────┴───────────┴───────────┴─────────┴──────────┴───┴─────────┴─────────┴─────────┴─────────┴────────┴──────────────────────────┴──────────────────────┴──────────┘
   2 rows                                                                                        use .last to show entire result                                                                                         24 columns (16 shown)
 ```
+
+There is no community build of the Zeek extension for DuckDB v2.0.0 yet. To use it with v2.0.0, build the extension from source (see [Building](#building)) and load it from the build directory (see [Loading the Extension](#loading-the-extension)).
 
 ## Zeek Types <-> DuckDB Types
 
@@ -111,8 +113,8 @@ SELECT COUNT(*) FROM read_zeek('logs/*/notice*', union_by_name=true, ignore_file
 
 ```bash
 # Clone with submodules
-git clone --recurse-submodules https://github.com/yourusername/duckdb-zeek.git
-cd duckdb-zeek
+git clone --recurse-submodules https://github.com/ynadji/zeek-duckdb.git
+cd zeek-duckdb
 
 # Build
 make release
@@ -123,7 +125,7 @@ make test
 
 ### Build Artifacts
 
-- `./build/release/duckdb` - DuckDB shell with extension loaded
+- `./build/release/duckdb` - DuckDB shell (the extension is not built in; load it as shown in [Loading the Extension](#loading-the-extension))
 - `./build/release/extension/zeek/zeek.duckdb_extension` - Loadable extension
 
 ## Loading the Extension
