@@ -2,6 +2,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
@@ -109,8 +110,12 @@ struct ZeekScanGlobalState : public GlobalTableFunctionState {
 	//! True if no columns are projected (e.g. COUNT(*)) — skip all parsing
 	bool count_only = false;
 
-	//! Pushed-down filters from DuckDB. The map key is the index into projected_schema_cols
-	//! (i.e. the output column index), NOT the schema column index. Null if no filters pushed down.
+	//! Schema column index for each scanned column, in DuckDB's column_ids order. Pushed-down filter keys are
+	//! positions in column_ids (not output positions), so they map back to schema columns through this list.
+	//! It differs from projected_schema_cols when projection_ids drops or reorders filter-only columns.
+	vector<column_t> scan_schema_cols;
+	//! Pushed-down filters from DuckDB. The map key is the index into scan_schema_cols. Null if no filters
+	//! were pushed down.
 	optional_ptr<TableFilterSet> filters;
 
 	//! For each output column index, true if its type isn't natively handled and needs the
@@ -158,6 +163,10 @@ struct ZeekScanLocalState : public LocalTableFunctionState {
 
 	//! Per-thread cast temp vectors, one per output column. nullptr for native columns.
 	vector<unique_ptr<Vector>> cast_temp_vecs;
+
+	//! Per-thread filter evaluators, indexed like ZeekScanGlobalState::scan_schema_cols (null where no filter
+	//! applies). Executors are not thread-safe, so each thread builds its own in ZeekScanInitLocal.
+	vector<unique_ptr<ExpressionExecutor>> filter_executors;
 };
 
 //! Get the read_zeek table function
